@@ -1,0 +1,71 @@
+---
+# Fork chezjv/Sunshine : compile Sunshine + patch « débit adaptatif » avec la recette Windows officielle du
+# projet (ci-windows.yml, donc toujours à jour), puis publie l'installeur dans une release du fork.
+# Lancé par sync.yml (branche « automatisation ») sur une branche adaptatif-<tag>.
+name: Build adaptatif
+permissions: {}
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: Tag Sunshine officiel dont cette branche dérive (ex. v2026.914.233613)
+        required: true
+        type: string
+
+jobs:
+  build:
+    name: Windows (recette officielle)
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci-windows.yml
+    with:
+      publish_release: 'false'
+      release_commit: ${{ github.sha }}
+      release_version: ${{ inputs.upstream_tag }}
+
+  release:
+    name: Publier la release du fork
+    needs: build
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Récupérer l'installeur Windows x64
+        uses: actions/download-artifact@v7
+        with:
+          name: build-Windows-AMD64
+          path: artifacts
+
+      - name: Créer la release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+          ls -la artifacts
+          release="${TAG}-adaptatif"
+          if gh release view "$release" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release delete "$release" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
+          fi
+          gh release create "$release" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "Sunshine ${TAG} + débit adaptatif" \
+            --notes "Build automatique : Sunshine ${TAG} officiel + patch « débit adaptatif » (encodeur NVENC). Installeur : Sunshine-Windows-AMD64-installer.msi. À activer avec « adaptive_bitrate = enabled » dans sunshine.conf." \
+            artifacts/Sunshine-Windows-AMD64-installer.msi \
+            artifacts/Sunshine-Windows-AMD64-lite.zip
+
+  notify:
+    name: Prévenir en cas d'échec
+    needs: [build, release]
+    if: ${{ failure() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Notification ntfy
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          TAG: ${{ inputs.upstream_tag }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          [ -n "$NTFY_TOPIC" ] || exit 0
+          curl -s -H "Title: Sunshine adaptatif" -d "La compilation de ${TAG}-adaptatif a échoué : ${RUN_URL}" "https://ntfy.sh/${NTFY_TOPIC}" >/dev/null
