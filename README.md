@@ -7,11 +7,15 @@ par paliers quand la liaison redevient propre, **sans interrompre le stream** (l
 Cette branche `automatisation` ne contient que l'outillage :
 
 - `patches/0001-*.patch` : la modification elle-même (candidate à une proposition au projet Sunshine) ;
-- `patches/0002-*.patch` : le workflow de compilation du fork (`build-adaptatif.yml`, réutilise la recette
-  Windows officielle `ci-windows.yml`) ;
-- `.github/workflows/sync.yml` : chaque lundi, applique les patches sur la dernière version stable de Sunshine,
-  pousse la branche `adaptatif-<tag>` et lance la compilation ; l'installeur est publié dans une release
-  `<tag>-adaptatif` de ce fork. En cas d'échec, notification ntfy (secret `NTFY_TOPIC`).
+- `patches/0002-*.patch` : le workflow de compilation du fork (`build-adaptatif.yml`), qui réutilise la recette
+  Windows officielle `ci-windows.yml` de la version compilée ;
+- `.github/workflows/build-adaptatif.yml` : copie du même workflow, présente ici pour que GitHub le liste.
+
+Les branches `adaptatif-<tag>` (= version officielle + patches) sont créées et poussées depuis un PC avec
+GitHub CLI (`sync_adaptatif.ps1`, chaque semaine), car le jeton automatique des Actions n'a pas le droit de
+pousser un fichier de workflow. La compilation est lancée sur cette branche (`gh workflow run build-adaptatif.yml
+--ref adaptatif-<tag>`) et l'installeur est publié dans la release `<tag>-adaptatif`. En cas d'échec,
+notification ntfy (secret `NTFY_TOPIC`).
 
 ## Options ajoutées à `sunshine.conf`
 
@@ -28,4 +32,4 @@ Moonlight envoie déjà à Sunshine un état FEC par image abîmée (`SS_FRAME_F
 perdus, reçus, parité) ainsi que des demandes d'image clé ou d'invalidation d'images quand il perd une image.
 Ces signaux alimentent un régulateur AIMD par session ; la nouvelle cible passe à la boucle d'encodage par un
 événement, et le backend NVENC l'applique avec `NvEncReconfigureEncoder()` (paramètres de débit seulement :
-pas de réinitialisation, pas d'image clé forcée).
+pas de réinitialisation, pas d'image clé forcée), après avoir vérifié la capacité `NV_ENC_CAPS_SUPPORT_DYN_BITRATE_CHANGE`.
