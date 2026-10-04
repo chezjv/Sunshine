@@ -1,6 +1,6 @@
-From b239003b6ee0b77352d8ce4006f13e35044ff5a6 Mon Sep 17 00:00:00 2001
+From 100603c07c0203ed4b9c558bdd498dedce8c9d99 Mon Sep 17 00:00:00 2001
 From: chezjv <chezjv@users.noreply.github.com>
-Date: Sun, 4 Oct 2026 22:35:38 +0200
+Date: Sun, 4 Oct 2026 23:15:19 +0200
 Subject: [PATCH 1/2] feat(video): adaptive bitrate driven by client loss
  reports (NVENC)
 
@@ -27,17 +27,17 @@ New configuration options: adaptive_bitrate (disabled by default),
 adaptive_bitrate_min_percent, adaptive_bitrate_decrease_percent and
 adaptive_bitrate_increase_delay.
 ---
- docs/configuration.md     | 114 +++++++++++++++++++++++++++++
- src/config.cpp            |  10 ++-
+ docs/configuration.md     | 114 ++++++++++++++++++++++
+ src/config.cpp            |  10 +-
  src/config.h              |   4 +
  src/globals.h             |   1 +
- src/nvenc/nvenc_base.cpp  |  47 ++++++++++++
- src/nvenc/nvenc_base.h    |  17 +++++
- src/nvenc/nvenc_encoder.h |   9 +++
- src/stream.cpp            | 150 ++++++++++++++++++++++++++++++++++++++
- src/video.cpp             |  22 ++++++
- src/video.h               |   9 +++
- 10 files changed, 382 insertions(+), 1 deletion(-)
+ src/nvenc/nvenc_base.cpp  |  47 ++++++++++
+ src/nvenc/nvenc_base.h    |  17 ++++
+ src/nvenc/nvenc_encoder.h |   9 ++
+ src/stream.cpp            | 193 ++++++++++++++++++++++++++++++++++++++
+ src/video.cpp             |  22 +++++
+ src/video.h               |   9 ++
+ 10 files changed, 425 insertions(+), 1 deletion(-)
 
 diff --git a/docs/configuration.md b/docs/configuration.md
 index 1ffd8250..024499f6 100644
@@ -339,10 +339,10 @@ index 4c750583..110b40ec 100644
  
  }  // namespace nvenc
 diff --git a/src/stream.cpp b/src/stream.cpp
-index 1291c9c6..c1b40cd3 100644
+index 1291c9c6..1b970aed 100644
 --- a/src/stream.cpp
 +++ b/src/stream.cpp
-@@ -365,6 +365,39 @@ namespace stream {
+@@ -365,6 +365,56 @@ namespace stream {
      }
    }
  
@@ -355,7 +355,7 @@ index 1291c9c6..c1b40cd3 100644
 +   * the link has stayed clean for a while. The bitrate never exceeds the value requested by the client.
 +   */
 +  struct adaptive_bitrate_t {
-+    bool enabled = false;
++    bool enabled = false;  ///< `true` when `adaptive_bitrate` is enabled and the client requested a bitrate.
 +    int requested_kbps = 0;  ///< Bitrate requested by the client (ceiling).
 +    int current_kbps = 0;  ///< Bitrate currently applied to the encoder.
 +    int min_kbps = 0;  ///< Floor derived from `adaptive_bitrate_min_percent`.
@@ -375,14 +375,31 @@ index 1291c9c6..c1b40cd3 100644
 +  constexpr int ABR_INCREASE_PERCENT = 15;  ///< Size of an upward step, in percent of the current bitrate.
 +  constexpr int ABR_STEP_KBPS = 500;  ///< Minimum upward step and rounding unit.
 +
++  /**
++   * @brief Reset the adaptive bitrate state for a new session.
++   * @param abr Controller state to initialize.
++   * @param requested_kbps Bitrate requested by the client, in kbps.
++   */
 +  void abr_init(adaptive_bitrate_t &abr, int requested_kbps);
++
++  /**
++   * @brief Evaluate the current measurement window; called on every periodic ping from the client.
++   * @param session Stream session.
++   */
 +  void abr_tick(session_t *session);
++
++  /**
++   * @brief Record a frame the client could not receive intact.
++   * @param session Stream session.
++   * @param lost_packets Number of video packets lost for that frame, when known.
++   * @param frame_dropped `true` when FEC could not repair the frame.
++   */
 +  void abr_note_loss(session_t *session, int lost_packets, bool frame_dropped);
 +
    /**
     * @brief ENet control server that routes incoming control packets to stream sessions.
     */
-@@ -513,6 +546,8 @@ namespace stream {
+@@ -513,6 +563,8 @@ namespace stream {
  
        safe::mail_raw_t::event_t<bool> idr_events;  ///< Event requesting an instantaneous decoder refresh frame.
        safe::mail_raw_t::event_t<std::pair<int64_t, int64_t>> invalidate_ref_frames_events;  ///< Event carrying the reference-frame range to invalidate.
@@ -391,10 +408,15 @@ index 1291c9c6..c1b40cd3 100644
  
        std::unique_ptr<platf::deinit_t> qos;  ///< Lifetime guard for video-socket QoS configuration.
      } video;  ///< Video worker thread state for the active stream.
-@@ -656,6 +691,91 @@ namespace stream {
+@@ -656,6 +708,117 @@ namespace stream {
      };
    }
  
++  /**
++   * @brief Reset the adaptive bitrate state for a new session.
++   * @param abr Controller state to initialize.
++   * @param requested_kbps Bitrate requested by the client, in kbps.
++   */
 +  void abr_init(adaptive_bitrate_t &abr, int requested_kbps) {
 +    abr = {};
 +    if (config::video.max_bitrate > 0) {
@@ -415,6 +437,12 @@ index 1291c9c6..c1b40cd3 100644
 +    }
 +  }
 +
++  /**
++   * @brief Apply a new bitrate target: round it, clamp it between the floor and the requested bitrate, and send it to the encoder.
++   * @param session Stream session.
++   * @param kbps Desired bitrate in kbps.
++   * @param reason Short description logged with the change.
++   */
 +  void abr_apply(session_t *session, int kbps, const char *reason) {
 +    auto &abr = session->video.abr;
 +    kbps = kbps / ABR_STEP_KBPS * ABR_STEP_KBPS;
@@ -427,6 +455,11 @@ index 1291c9c6..c1b40cd3 100644
 +    session->video.bitrate_events->raise(kbps);
 +  }
 +
++  /**
++   * @brief Cut the bitrate after losses, at most once per cooldown period.
++   * @param session Stream session.
++   * @param reason Short description logged with the change.
++   */
 +  void abr_decrease(session_t *session, const char *reason) {
 +    auto &abr = session->video.abr;
 +    auto now = std::chrono::steady_clock::now();
@@ -442,6 +475,12 @@ index 1291c9c6..c1b40cd3 100644
 +    abr_apply(session, abr.current_kbps * (100 - config::video.adaptive_bitrate_decrease_percent) / 100, reason);
 +  }
 +
++  /**
++   * @brief Record a frame the client could not receive intact.
++   * @param session Stream session.
++   * @param lost_packets Number of video packets lost for that frame, when known.
++   * @param frame_dropped `true` when FEC could not repair the frame.
++   */
 +  void abr_note_loss(session_t *session, int lost_packets, bool frame_dropped) {
 +    auto &abr = session->video.abr;
 +    if (!abr.enabled) {
@@ -455,6 +494,10 @@ index 1291c9c6..c1b40cd3 100644
 +    }
 +  }
 +
++  /**
++   * @brief Evaluate the current measurement window; called on every periodic ping from the client.
++   * @param session Stream session.
++   */
 +  void abr_tick(session_t *session) {
 +    auto &abr = session->video.abr;
 +    if (!abr.enabled) {
@@ -483,7 +526,7 @@ index 1291c9c6..c1b40cd3 100644
    session_t *control_server_t::get_session(const net::peer_t peer, uint32_t connect_data) {
      {
        // Fast path - look up existing session by peer
-@@ -1163,6 +1283,7 @@ namespace stream {
+@@ -1163,6 +1326,7 @@ namespace stream {
     */
    void controlBroadcastThread(control_server_t *server) {
      server->map(packetTypes[IDX_PERIODIC_PING], [](session_t *session, const std::string_view &payload) {
@@ -491,7 +534,7 @@ index 1291c9c6..c1b40cd3 100644
        BOOST_LOG(verbose) << "type [IDX_PERIODIC_PING]"sv;
      });
  
-@@ -1175,6 +1296,7 @@ namespace stream {
+@@ -1175,6 +1339,7 @@ namespace stream {
      });
  
      server->map(packetTypes[IDX_LOSS_STATS], [&](session_t *session, const std::string_view &payload) {
@@ -499,7 +542,7 @@ index 1291c9c6..c1b40cd3 100644
        int32_t *stats = (int32_t *) payload.data();
        auto count = stats[0];
        std::chrono::milliseconds t {stats[1]};
-@@ -1190,10 +1312,35 @@ namespace stream {
+@@ -1190,10 +1355,35 @@ namespace stream {
          << "---end stats---";
      });
  
@@ -535,7 +578,7 @@ index 1291c9c6..c1b40cd3 100644
      });
  
      server->map(packetTypes[IDX_INVALIDATE_REF_FRAMES], [&](session_t *session, const std::string_view &payload) {
-@@ -1207,6 +1354,7 @@ namespace stream {
+@@ -1207,6 +1397,7 @@ namespace stream {
          << "lastFrame [" << lastFrame << ']';
  
        session->video.invalidate_ref_frames_events->raise(std::make_pair(firstFrame, lastFrame));
@@ -543,7 +586,7 @@ index 1291c9c6..c1b40cd3 100644
      });
  
      server->map(packetTypes[IDX_INPUT_DATA], [&](session_t *session, const std::string_view &payload) {
-@@ -2330,6 +2478,8 @@ namespace stream {
+@@ -2330,6 +2521,8 @@ namespace stream {
  
        session->video.idr_events = mail->event<bool>(mail::idr);
        session->video.invalidate_ref_frames_events = mail->event<std::pair<int64_t, int64_t>>(mail::invalidate_ref_frames);
