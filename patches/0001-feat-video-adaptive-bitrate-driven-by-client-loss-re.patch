@@ -1,6 +1,6 @@
-From 6375fa592fcede1c57ddce7d9e74976d47744bfc Mon Sep 17 00:00:00 2001
+From b239003b6ee0b77352d8ce4006f13e35044ff5a6 Mon Sep 17 00:00:00 2001
 From: chezjv <chezjv@users.noreply.github.com>
-Date: Sun, 4 Oct 2026 22:30:20 +0200
+Date: Sun, 4 Oct 2026 22:35:38 +0200
 Subject: [PATCH 1/2] feat(video): adaptive bitrate driven by client loss
  reports (NVENC)
 
@@ -31,13 +31,13 @@ adaptive_bitrate_increase_delay.
  src/config.cpp            |  10 ++-
  src/config.h              |   4 +
  src/globals.h             |   1 +
- src/nvenc/nvenc_base.cpp  |  42 +++++++++++
- src/nvenc/nvenc_base.h    |  16 ++++
+ src/nvenc/nvenc_base.cpp  |  47 ++++++++++++
+ src/nvenc/nvenc_base.h    |  17 +++++
  src/nvenc/nvenc_encoder.h |   9 +++
  src/stream.cpp            | 150 ++++++++++++++++++++++++++++++++++++++
  src/video.cpp             |  22 ++++++
  src/video.h               |   9 +++
- 10 files changed, 376 insertions(+), 1 deletion(-)
+ 10 files changed, 382 insertions(+), 1 deletion(-)
 
 diff --git a/docs/configuration.md b/docs/configuration.md
 index 1ffd8250..024499f6 100644
@@ -220,10 +220,10 @@ index 2c7ee9b1..2dd7f6b2 100644
    MAIL(hdr);  ///< HDR.
  #undef MAIL
 diff --git a/src/nvenc/nvenc_base.cpp b/src/nvenc/nvenc_base.cpp
-index d20ca836..9a41a7b0 100644
+index d20ca836..aea515b0 100644
 --- a/src/nvenc/nvenc_base.cpp
 +++ b/src/nvenc/nvenc_base.cpp
-@@ -671,12 +671,54 @@ namespace NVENC_NAMESPACE {
+@@ -671,12 +671,59 @@ namespace NVENC_NAMESPACE {
      BOOST_LOG(debug) << "NvEnc: requested encoded frame size "
                       << frame_size_format % (client_config.bitrate / 8. / client_config.framerate) << " kB";
      log_created_encoder(init_params, enc_config, config, client_config, buffer_format);
@@ -233,6 +233,7 @@ index d20ca836..9a41a7b0 100644
 +    reconfigure_state.framerate = client_config.framerate;
 +    reconfigure_state.vbv_percentage_increase = config.vbv_percentage_increase;
 +    reconfigure_state.custom_vbv = get_encoder_cap(init_params.encodeGUID, NV_ENC_CAPS_SUPPORT_CUSTOM_VBV_BUF_SIZE) != 0;
++    reconfigure_state.dynamic_bitrate_supported = get_encoder_cap(init_params.encodeGUID, NV_ENC_CAPS_SUPPORT_DYN_BITRATE_CHANGE) != 0;
 +    reconfigure_state.bitrate_kbps = client_config.bitrate;
  
      encoder_state = {};
@@ -246,6 +247,10 @@ index d20ca836..9a41a7b0 100644
 +    }
 +    if (bitrate_kbps == reconfigure_state.bitrate_kbps) {
 +      return true;
++    }
++    if (!reconfigure_state.dynamic_bitrate_supported) {
++      BOOST_LOG(warning) << "NvEnc: the encoder does not support dynamic bitrate changes";
++      return false;
 +    }
 +
 +    auto &rc = reconfigure_state.config.rcParams;
@@ -279,7 +284,7 @@ index d20ca836..9a41a7b0 100644
      if (output_bitstream) {
        if (nvenc_failed(nvenc->nvEncDestroyBitstreamBuffer(encoder, output_bitstream))) {
 diff --git a/src/nvenc/nvenc_base.h b/src/nvenc/nvenc_base.h
-index 8f9c8b01..5829a101 100644
+index 8f9c8b01..cf5d1149 100644
 --- a/src/nvenc/nvenc_base.h
 +++ b/src/nvenc/nvenc_base.h
 @@ -75,6 +75,13 @@ namespace NVENC_NAMESPACE {
@@ -296,7 +301,7 @@ index 8f9c8b01..5829a101 100644
    protected:
      /**
       * @brief Required. Used for loading NvEnc library and setting `nvenc` variable with `NvEncodeAPICreateInstance()`.
-@@ -336,6 +343,15 @@ namespace NVENC_NAMESPACE {
+@@ -336,6 +343,16 @@ namespace NVENC_NAMESPACE {
        std::pair<uint64_t, uint64_t> last_rfi_range;
        logging::min_max_avg_periodic_logger<double> frame_size_logger = {debug, "NvEnc: encoded frame sizes in kB", ""};
      } encoder_state;
@@ -307,6 +312,7 @@ index 8f9c8b01..5829a101 100644
 +      int framerate = 0;
 +      int vbv_percentage_increase = 0;
 +      bool custom_vbv = false;
++      bool dynamic_bitrate_supported = false;  ///< `NV_ENC_CAPS_SUPPORT_DYN_BITRATE_CHANGE` reported by the encoder.
 +      uint32_t bitrate_kbps = 0;
 +    } reconfigure_state;  ///< Copy of the creation parameters, reused by `set_bitrate()`.
    };

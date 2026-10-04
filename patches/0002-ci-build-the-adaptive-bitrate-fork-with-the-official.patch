@@ -1,6 +1,6 @@
-From 0e3e8e7de280d6f1dac92f008be5462ef03515db Mon Sep 17 00:00:00 2001
+From c11ff7ac4b988c8e4a856d54684cac3fa8198a5a Mon Sep 17 00:00:00 2001
 From: chezjv <chezjv@users.noreply.github.com>
-Date: Sun, 4 Oct 2026 22:31:56 +0200
+Date: Sun, 4 Oct 2026 22:35:38 +0200
 Subject: [PATCH 2/2] ci: build the adaptive bitrate fork with the official
  Windows recipe and publish a fork release
 
