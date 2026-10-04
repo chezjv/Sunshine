@@ -1,0 +1,83 @@
+---
+# Branche « automatisation » du fork chezjv/Sunshine.
+# Chaque lundi (ou à la demande) : si Sunshine a publié une nouvelle version stable, crée la branche
+# adaptatif-<tag> = version officielle + patches/*.patch, la pousse sur le fork et lance build-adaptatif.yml
+# dessus (ce workflow fait partie des patches). Rien n'est fait si la release <tag>-adaptatif existe déjà.
+name: Synchroniser et compiler
+permissions: {}
+
+on:
+  schedule:
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag Sunshine à construire (vide = dernière version stable)
+        required: false
+        type: string
+      force:
+        description: Reconstruire même si la release du fork existe déjà
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  sync:
+    name: Appliquer le patch et lancer la compilation
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+    steps:
+      - name: Récupérer les patches
+        uses: actions/checkout@v7
+
+      - name: Choisir la version
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_DEMANDE: ${{ inputs.tag }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          tag="${TAG_DEMANDE:-$(gh release view --repo LizardByte/Sunshine --json tagName --jq .tagName)}"
+          echo "version upstream : $tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if [ "$FORCE" != "true" ] && gh release view "${tag}-adaptatif" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "deja construit : ${tag}-adaptatif, rien a faire"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Construire la branche patchée
+        if: steps.version.outputs.skip == 'false'
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git clone --quiet --branch "$TAG" --single-branch https://github.com/LizardByte/Sunshine.git /tmp/sunshine
+          cd /tmp/sunshine
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git am --3way "$GITHUB_WORKSPACE"/patches/*.patch
+          git log --oneline -4
+          git push --quiet --force "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:refs/heads/adaptatif-${TAG}"
+
+      - name: Lancer la compilation
+        if: steps.version.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: gh workflow run build-adaptatif.yml --repo "$GITHUB_REPOSITORY" --ref "adaptatif-${TAG}" -f "upstream_tag=${TAG}"
+
+      - name: Prévenir en cas d'échec
+        if: ${{ failure() }}
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          TAG: ${{ steps.version.outputs.tag }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          [ -n "$NTFY_TOPIC" ] || exit 0
+          curl -s -H "Title: Sunshine adaptatif" -d "Le patch ne s'applique plus sur ${TAG} (ou la synchronisation a échoué) : ${RUN_URL}" "https://ntfy.sh/${NTFY_TOPIC}" >/dev/null

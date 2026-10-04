@@ -1,0 +1,639 @@
+From 6375fa592fcede1c57ddce7d9e74976d47744bfc Mon Sep 17 00:00:00 2001
+From: chezjv <chezjv@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 22:30:20 +0200
+Subject: [PATCH 1/2] feat(video): adaptive bitrate driven by client loss
+ reports (NVENC)
+
+Lower the encoder bitrate while Moonlight reports packet loss and raise it
+back, step by step, once the link has stayed clean, without interrupting the
+stream.
+
+Moonlight already sends Sunshine a per-frame FEC status (SS_FRAME_FEC_STATUS,
+type 0x5502) for every frame that needed FEC recovery or was dropped, plus IDR
+and reference frame invalidation requests when frames are lost. Those reports
+now feed a small AIMD controller per session: a one second window with losses
+cuts the bitrate (default 25 %, floor 20 % of the requested bitrate, 2 s
+cooldown), a dropped frame cuts it right away, and after a configurable clean
+period (default 8 s, doubling after each increase that caused losses) the
+bitrate is raised again by 15 %, never above what the client requested.
+
+The new target reaches the encoder through a mail event consumed by the encode
+loop. The NVENC backend applies it with NvEncReconfigureEncoder(): only the
+rate control parameters change, with no encoder reset and no forced IDR frame,
+so the client only sees smaller or larger frames from the next frame on. Other
+encoders ignore the request.
+
+New configuration options: adaptive_bitrate (disabled by default),
+adaptive_bitrate_min_percent, adaptive_bitrate_decrease_percent and
+adaptive_bitrate_increase_delay.
+---
+ docs/configuration.md     | 114 +++++++++++++++++++++++++++++
+ src/config.cpp            |  10 ++-
+ src/config.h              |   4 +
+ src/globals.h             |   1 +
+ src/nvenc/nvenc_base.cpp  |  42 +++++++++++
+ src/nvenc/nvenc_base.h    |  16 ++++
+ src/nvenc/nvenc_encoder.h |   9 +++
+ src/stream.cpp            | 150 ++++++++++++++++++++++++++++++++++++++
+ src/video.cpp             |  22 ++++++
+ src/video.h               |   9 +++
+ 10 files changed, 376 insertions(+), 1 deletion(-)
+
+diff --git a/docs/configuration.md b/docs/configuration.md
+index 1ffd8250..024499f6 100644
+--- a/docs/configuration.md
++++ b/docs/configuration.md
+@@ -1494,6 +1494,120 @@ supported on the current platform.
+     </tr>
+ </table>
+ 
++### adaptive_bitrate
++
++<table>
++    <tr>
++        <td>Description</td>
++        <td colspan="2">
++            Lower the video bitrate while the client reports packet loss and raise it back, step by step, once the
++            link has been clean for a while. The bitrate never exceeds the value requested by Moonlight and the
++            encoder is reconfigured on the fly, so the stream is never interrupted. Requires the NVENC encoder.
++        </td>
++    </tr>
++    <tr>
++        <td>Default</td>
++        <td colspan="2">@code{}
++            disabled
++            @endcode</td>
++    </tr>
++    <tr>
++        <td>Example</td>
++        <td colspan="2">@code{}
++            adaptive_bitrate = enabled
++            @endcode</td>
++    </tr>
++</table>
++
++### adaptive_bitrate_min_percent
++
++<table>
++    <tr>
++        <td>Description</td>
++        <td colspan="2">
++            Floor of the adaptive bitrate, in percent of the bitrate requested by Moonlight.
++        </td>
++    </tr>
++    <tr>
++        <td>Default</td>
++        <td colspan="2">@code{}
++            20
++            @endcode</td>
++    </tr>
++    <tr>
++        <td>Range</td>
++        <td colspan="2">@code{}
++            5-100
++            @endcode</td>
++    </tr>
++    <tr>
++        <td>Example</td>
++        <td colspan="2">@code{}
++            adaptive_bitrate_min_percent = 30
++            @endcode</td>
++    </tr>
++</table>
++
++### adaptive_bitrate_decrease_percent
++
++<table>
++    <tr>
++        <td>Description</td>
++        <td colspan="2">
++            Bitrate reduction applied each time a one second window contains packet loss, in percent of the current bitrate.
++        </td>
++    </tr>
++    <tr>
++        <td>Default</td>
++        <td colspan="2">@code{}
++            25
++            @endcode</td>
++    </tr>
++    <tr>
++        <td>Range</td>
++        <td colspan="2">@code{}
++            5-75
++            @endcode</td>
++    </tr>
++    <tr>
++        <td>Example</td>
++        <td colspan="2">@code{}
++            adaptive_bitrate_decrease_percent = 30
++            @endcode</td>
++    </tr>
++</table>
++
++### adaptive_bitrate_increase_delay
++
++<table>
++    <tr>
++        <td>Description</td>
++        <td colspan="2">
++            Time without any packet loss, in milliseconds, required before the bitrate is raised again (by 15%, at least
++            500 kbps). The wait doubles each time an increase is followed by losses, up to 60 seconds.
++        </td>
++    </tr>
++    <tr>
++        <td>Default</td>
++        <td colspan="2">@code{}
++            8000
++            @endcode</td>
++    </tr>
++    <tr>
++        <td>Range</td>
++        <td colspan="2">@code{}
++            1000-60000
++            @endcode</td>
++    </tr>
++    <tr>
++        <td>Example</td>
++        <td colspan="2">@code{}
++            adaptive_bitrate_increase_delay = 5000
++            @endcode</td>
++    </tr>
++</table>
++
++
+ ## Network
+ 
+ ### upnp
+diff --git a/src/config.cpp b/src/config.cpp
+index e0e86473..31539ad8 100644
+--- a/src/config.cpp
++++ b/src/config.cpp
+@@ -795,7 +795,11 @@ namespace config {
+     },  // display_device
+ 
+     0,  // max_bitrate
+-    0  // minimum_fps_target (0 = framerate)
++    0,  // minimum_fps_target (0 = framerate)
++    false,  // adaptive_bitrate
++    20,  // adaptive_bitrate_min_percent
++    25,  // adaptive_bitrate_decrease_percent
++    8000  // adaptive_bitrate_increase_delay
+   };
+ 
+   /**
+@@ -1722,6 +1726,10 @@ namespace config {
+ 
+     int_f(vars, "max_bitrate", video.max_bitrate);
+     double_between_f(vars, "minimum_fps_target", video.minimum_fps_target, {0.0, 1000.0});
++    bool_f(vars, "adaptive_bitrate", video.adaptive_bitrate);
++    int_between_f(vars, "adaptive_bitrate_min_percent", video.adaptive_bitrate_min_percent, {5, 100});
++    int_between_f(vars, "adaptive_bitrate_decrease_percent", video.adaptive_bitrate_decrease_percent, {5, 75});
++    int_between_f(vars, "adaptive_bitrate_increase_delay", video.adaptive_bitrate_increase_delay, {1000, 60000});
+ 
+     path_f(vars, "pkey", nvhttp.pkey);
+     path_f(vars, "cert", nvhttp.cert);
+diff --git a/src/config.h b/src/config.h
+index 78615387..85923b52 100644
+--- a/src/config.h
++++ b/src/config.h
+@@ -219,6 +219,10 @@ namespace config {
+ 
+     int max_bitrate;  ///< Maximum bitrate ceiling in kbps for bitrate requested from the client.
+     double minimum_fps_target;  ///< Lowest framerate that will be used when streaming. Range 0-1000, 0 = half of client's requested framerate.
++    bool adaptive_bitrate;  ///< Lower the encoder bitrate while packets are being lost and raise it back once the link is clean.
++    int adaptive_bitrate_min_percent;  ///< Floor of the adaptive bitrate, in percent of the bitrate requested by the client. Range 5-100.
++    int adaptive_bitrate_decrease_percent;  ///< Bitrate reduction applied at each lossy period, in percent. Range 5-75.
++    int adaptive_bitrate_increase_delay;  ///< Clean time, in milliseconds, required before raising the bitrate again. Range 1000-60000.
+   };
+ 
+   /**
+diff --git a/src/globals.h b/src/globals.h
+index 2c7ee9b1..2dd7f6b2 100644
+--- a/src/globals.h
++++ b/src/globals.h
+@@ -57,6 +57,7 @@ namespace mail {
+   MAIL(touch_port);  ///< Touch port.
+   MAIL(idr);  ///< IDR.
+   MAIL(invalidate_ref_frames);  ///< Invalidate ref frames.
++  MAIL(bitrate);  ///< Adaptive bitrate target in kbps.
+   MAIL(gamepad_feedback);  ///< Gamepad feedback.
+   MAIL(hdr);  ///< HDR.
+ #undef MAIL
+diff --git a/src/nvenc/nvenc_base.cpp b/src/nvenc/nvenc_base.cpp
+index d20ca836..9a41a7b0 100644
+--- a/src/nvenc/nvenc_base.cpp
++++ b/src/nvenc/nvenc_base.cpp
+@@ -671,12 +671,54 @@ namespace NVENC_NAMESPACE {
+     BOOST_LOG(debug) << "NvEnc: requested encoded frame size "
+                      << frame_size_format % (client_config.bitrate / 8. / client_config.framerate) << " kB";
+     log_created_encoder(init_params, enc_config, config, client_config, buffer_format);
++    reconfigure_state.init_params = init_params;
++    reconfigure_state.config = enc_config;
++    reconfigure_state.init_params.encodeConfig = &reconfigure_state.config;
++    reconfigure_state.framerate = client_config.framerate;
++    reconfigure_state.vbv_percentage_increase = config.vbv_percentage_increase;
++    reconfigure_state.custom_vbv = get_encoder_cap(init_params.encodeGUID, NV_ENC_CAPS_SUPPORT_CUSTOM_VBV_BUF_SIZE) != 0;
++    reconfigure_state.bitrate_kbps = client_config.bitrate;
+ 
+     encoder_state = {};
+     fail_guard.disable();
+     return true;
+   }
+ 
++  bool nvenc_base::set_bitrate(uint32_t bitrate_kbps) {
++    if (!encoder || !nvenc || bitrate_kbps == 0) {
++      return false;
++    }
++    if (bitrate_kbps == reconfigure_state.bitrate_kbps) {
++      return true;
++    }
++
++    auto &rc = reconfigure_state.config.rcParams;
++    rc.averageBitRate = bitrate_kbps * 1000;
++    if (reconfigure_state.custom_vbv && reconfigure_state.framerate > 0) {
++      rc.vbvBufferSize = bitrate_kbps * 1000 / reconfigure_state.framerate;
++      if (reconfigure_state.vbv_percentage_increase > 0) {
++        rc.vbvBufferSize += rc.vbvBufferSize * reconfigure_state.vbv_percentage_increase / 100;
++      }
++    }
++
++    // Only the rate control parameters change: no encoder reset and no forced IDR frame,
++    // so the client sees nothing but a different frame size from the next frame on.
++    NV_ENC_RECONFIGURE_PARAMS reconfigure_params = {.version = NV_ENC_RECONFIGURE_PARAMS_VER};
++    reconfigure_params.reInitEncodeParams = reconfigure_state.init_params;
++    reconfigure_params.reInitEncodeParams.encodeConfig = &reconfigure_state.config;
++    reconfigure_params.resetEncoder = 0;
++    reconfigure_params.forceIDR = 0;
++
++    if (nvenc_failed(nvenc->nvEncReconfigureEncoder(encoder, &reconfigure_params))) {
++      BOOST_LOG(error) << "NvEnc: NvEncReconfigureEncoder() failed: " << last_nvenc_error_string;
++      return false;
++    }
++
++    BOOST_LOG(info) << "NvEnc: bitrate changed from " << reconfigure_state.bitrate_kbps << " to " << bitrate_kbps << " kbps";
++    reconfigure_state.bitrate_kbps = bitrate_kbps;
++    return true;
++  }
++
+   void nvenc_base::destroy_encoder() {
+     if (output_bitstream) {
+       if (nvenc_failed(nvenc->nvEncDestroyBitstreamBuffer(encoder, output_bitstream))) {
+diff --git a/src/nvenc/nvenc_base.h b/src/nvenc/nvenc_base.h
+index 8f9c8b01..5829a101 100644
+--- a/src/nvenc/nvenc_base.h
++++ b/src/nvenc/nvenc_base.h
+@@ -75,6 +75,13 @@ namespace NVENC_NAMESPACE {
+      */
+     bool invalidate_ref_frames(uint64_t first_frame, uint64_t last_frame) override;
+ 
++    /**
++     * @brief Reconfigure the running encoder with a new average bitrate (`NvEncReconfigureEncoder()`).
++     * @param bitrate_kbps New average bitrate in kbps.
++     * @return `true` when the encoder applied the new bitrate.
++     */
++    bool set_bitrate(uint32_t bitrate_kbps) override;
++
+   protected:
+     /**
+      * @brief Required. Used for loading NvEnc library and setting `nvenc` variable with `NvEncodeAPICreateInstance()`.
+@@ -336,6 +343,15 @@ namespace NVENC_NAMESPACE {
+       std::pair<uint64_t, uint64_t> last_rfi_range;
+       logging::min_max_avg_periodic_logger<double> frame_size_logger = {debug, "NvEnc: encoded frame sizes in kB", ""};
+     } encoder_state;
++
++    struct {
++      NV_ENC_INITIALIZE_PARAMS init_params = {};
++      NV_ENC_CONFIG config = {};
++      int framerate = 0;
++      int vbv_percentage_increase = 0;
++      bool custom_vbv = false;
++      uint32_t bitrate_kbps = 0;
++    } reconfigure_state;  ///< Copy of the creation parameters, reused by `set_bitrate()`.
+   };
+ 
+ }  // namespace NVENC_NAMESPACE
+diff --git a/src/nvenc/nvenc_encoder.h b/src/nvenc/nvenc_encoder.h
+index 4c750583..110b40ec 100644
+--- a/src/nvenc/nvenc_encoder.h
++++ b/src/nvenc/nvenc_encoder.h
+@@ -70,6 +70,15 @@ namespace nvenc {
+      * @return `true` on success, `false` on error.
+      */
+     virtual bool invalidate_ref_frames(std::uint64_t first_frame, std::uint64_t last_frame) = 0;
++
++    /**
++     * @brief Change the target bitrate of a running encoder without recreating it.
++     * @param bitrate_kbps New average bitrate in kbps.
++     * @return `true` when the encoder applied the new bitrate.
++     */
++    virtual bool set_bitrate(std::uint32_t bitrate_kbps) {
++      return false;
++    }
+   };
+ 
+ }  // namespace nvenc
+diff --git a/src/stream.cpp b/src/stream.cpp
+index 1291c9c6..c1b40cd3 100644
+--- a/src/stream.cpp
++++ b/src/stream.cpp
+@@ -365,6 +365,39 @@ namespace stream {
+     }
+   }
+ 
++  /**
++   * @brief Host-side adaptive bitrate controller state, one per session.
++   *
++   * Moonlight reports every frame that needed FEC recovery or was dropped (`SS_FRAME_FEC_STATUS`) and asks for
++   * an IDR frame or a reference frame invalidation when a frame was lost. Those signals drive an AIMD loop:
++   * the encoder bitrate is cut when a one second window contains losses and raised again, step by step, once
++   * the link has stayed clean for a while. The bitrate never exceeds the value requested by the client.
++   */
++  struct adaptive_bitrate_t {
++    bool enabled = false;
++    int requested_kbps = 0;  ///< Bitrate requested by the client (ceiling).
++    int current_kbps = 0;  ///< Bitrate currently applied to the encoder.
++    int min_kbps = 0;  ///< Floor derived from `adaptive_bitrate_min_percent`.
++    std::chrono::steady_clock::time_point window_start;  ///< Start of the current one second measurement window.
++    std::chrono::steady_clock::time_point last_decrease;  ///< Last time the bitrate was cut.
++    std::chrono::steady_clock::time_point last_increase;  ///< Last time the bitrate was raised.
++    std::chrono::steady_clock::time_point last_loss;  ///< Last time a loss was reported.
++    std::chrono::milliseconds probe_delay {0};  ///< Clean time required before the next increase; grows when an increase causes losses.
++    int impaired_frames = 0;  ///< Frames repaired by FEC, dropped or invalidated in the current window.
++    int lost_packets = 0;  ///< Video packets lost in the current window.
++  };
++
++  constexpr auto ABR_WINDOW = std::chrono::milliseconds {1000};  ///< Measurement window.
++  constexpr auto ABR_DECREASE_COOLDOWN = std::chrono::milliseconds {2000};  ///< Minimum time between two cuts.
++  constexpr auto ABR_FAILED_PROBE_WINDOW = std::chrono::milliseconds {10000};  ///< A cut this soon after an increase marks the increase as a failed probe.
++  constexpr auto ABR_PROBE_DELAY_MAX = std::chrono::milliseconds {60000};  ///< Longest wait before probing upwards again.
++  constexpr int ABR_INCREASE_PERCENT = 15;  ///< Size of an upward step, in percent of the current bitrate.
++  constexpr int ABR_STEP_KBPS = 500;  ///< Minimum upward step and rounding unit.
++
++  void abr_init(adaptive_bitrate_t &abr, int requested_kbps);
++  void abr_tick(session_t *session);
++  void abr_note_loss(session_t *session, int lost_packets, bool frame_dropped);
++
+   /**
+    * @brief ENet control server that routes incoming control packets to stream sessions.
+    */
+@@ -513,6 +546,8 @@ namespace stream {
+ 
+       safe::mail_raw_t::event_t<bool> idr_events;  ///< Event requesting an instantaneous decoder refresh frame.
+       safe::mail_raw_t::event_t<std::pair<int64_t, int64_t>> invalidate_ref_frames_events;  ///< Event carrying the reference-frame range to invalidate.
++      safe::mail_raw_t::event_t<int> bitrate_events;  ///< Event carrying a new adaptive bitrate target in kbps.
++      adaptive_bitrate_t abr;  ///< Adaptive bitrate controller state.
+ 
+       std::unique_ptr<platf::deinit_t> qos;  ///< Lifetime guard for video-socket QoS configuration.
+     } video;  ///< Video worker thread state for the active stream.
+@@ -656,6 +691,91 @@ namespace stream {
+     };
+   }
+ 
++  void abr_init(adaptive_bitrate_t &abr, int requested_kbps) {
++    abr = {};
++    if (config::video.max_bitrate > 0) {
++      requested_kbps = std::min(requested_kbps, config::video.max_bitrate);
++    }
++    abr.enabled = config::video.adaptive_bitrate && requested_kbps > 0;
++    abr.requested_kbps = requested_kbps;
++    abr.current_kbps = requested_kbps;
++    abr.min_kbps = std::max(ABR_STEP_KBPS, requested_kbps * config::video.adaptive_bitrate_min_percent / 100);
++    abr.probe_delay = std::chrono::milliseconds {config::video.adaptive_bitrate_increase_delay};
++    auto now = std::chrono::steady_clock::now();
++    abr.window_start = now;
++    abr.last_decrease = now;
++    abr.last_increase = now;
++    abr.last_loss = now;
++    if (abr.enabled) {
++      BOOST_LOG(info) << "Adaptive bitrate enabled: "sv << requested_kbps << " kbps requested, floor "sv << abr.min_kbps << " kbps"sv;
++    }
++  }
++
++  void abr_apply(session_t *session, int kbps, const char *reason) {
++    auto &abr = session->video.abr;
++    kbps = kbps / ABR_STEP_KBPS * ABR_STEP_KBPS;
++    kbps = std::max(abr.min_kbps, std::min(kbps, abr.requested_kbps));
++    if (kbps == abr.current_kbps) {
++      return;
++    }
++    BOOST_LOG(info) << "Adaptive bitrate: "sv << abr.current_kbps << " -> "sv << kbps << " kbps ("sv << reason << ')';
++    abr.current_kbps = kbps;
++    session->video.bitrate_events->raise(kbps);
++  }
++
++  void abr_decrease(session_t *session, const char *reason) {
++    auto &abr = session->video.abr;
++    auto now = std::chrono::steady_clock::now();
++    abr.last_loss = now;
++    if (now - abr.last_decrease < ABR_DECREASE_COOLDOWN) {
++      return;
++    }
++    if (abr.last_increase > abr.last_decrease && now - abr.last_increase < ABR_FAILED_PROBE_WINDOW) {
++      // the last increase caused losses: wait longer before probing upwards again
++      abr.probe_delay = std::min<std::chrono::milliseconds>(ABR_PROBE_DELAY_MAX, abr.probe_delay * 2);
++    }
++    abr.last_decrease = now;
++    abr_apply(session, abr.current_kbps * (100 - config::video.adaptive_bitrate_decrease_percent) / 100, reason);
++  }
++
++  void abr_note_loss(session_t *session, int lost_packets, bool frame_dropped) {
++    auto &abr = session->video.abr;
++    if (!abr.enabled) {
++      return;
++    }
++    abr.impaired_frames += 1;
++    abr.lost_packets += std::max(0, lost_packets);
++    if (frame_dropped) {
++      // FEC could not repair the frame: react right away instead of waiting for the end of the window
++      abr_decrease(session, "frame lost");
++    }
++  }
++
++  void abr_tick(session_t *session) {
++    auto &abr = session->video.abr;
++    if (!abr.enabled) {
++      return;
++    }
++    auto now = std::chrono::steady_clock::now();
++    if (now - abr.window_start < ABR_WINDOW) {
++      return;
++    }
++    bool lossy = abr.impaired_frames >= 2 || abr.lost_packets >= 5;
++    abr.window_start = now;
++    abr.impaired_frames = 0;
++    abr.lost_packets = 0;
++    if (lossy) {
++      abr_decrease(session, "packet loss");
++      return;
++    }
++    if (abr.current_kbps < abr.requested_kbps && now - abr.last_loss >= abr.probe_delay && now - abr.last_increase >= abr.probe_delay) {
++      // the link has been clean long enough: probe upwards, and relax the wait after each successful step
++      abr.last_increase = now;
++      abr.probe_delay = std::max<std::chrono::milliseconds>(std::chrono::milliseconds {config::video.adaptive_bitrate_increase_delay}, abr.probe_delay / 2);
++      abr_apply(session, std::max(abr.current_kbps + ABR_STEP_KBPS, abr.current_kbps * (100 + ABR_INCREASE_PERCENT) / 100), "clean link");
++    }
++  }
++
+   session_t *control_server_t::get_session(const net::peer_t peer, uint32_t connect_data) {
+     {
+       // Fast path - look up existing session by peer
+@@ -1163,6 +1283,7 @@ namespace stream {
+    */
+   void controlBroadcastThread(control_server_t *server) {
+     server->map(packetTypes[IDX_PERIODIC_PING], [](session_t *session, const std::string_view &payload) {
++      abr_tick(session);  // every ~100 ms with Sunshine-aware clients
+       BOOST_LOG(verbose) << "type [IDX_PERIODIC_PING]"sv;
+     });
+ 
+@@ -1175,6 +1296,7 @@ namespace stream {
+     });
+ 
+     server->map(packetTypes[IDX_LOSS_STATS], [&](session_t *session, const std::string_view &payload) {
++      abr_tick(session);  // every ~50 ms with legacy clients
+       int32_t *stats = (int32_t *) payload.data();
+       auto count = stats[0];
+       std::chrono::milliseconds t {stats[1]};
+@@ -1190,10 +1312,35 @@ namespace stream {
+         << "---end stats---";
+     });
+ 
++    // Per-frame FEC status (Sunshine protocol extension sent by moonlight-common-c for every frame that needed
++    // FEC recovery or was dropped). Fields are big-endian; parsed by offset so struct packing cannot matter.
++    server->map(SS_FRAME_FEC_PTYPE, [](session_t *session, const std::string_view &payload) {
++      constexpr std::size_t fec_status_size = 21;
++      if (payload.size() < fec_status_size) {
++        BOOST_LOG(debug) << "type [SS_FRAME_FEC_PTYPE] with unexpected size "sv << payload.size();
++        return;
++      }
++      auto u16 = [&payload](std::size_t offset) {
++        return (std::uint16_t) (((std::uint8_t) payload[offset] << 8) | (std::uint8_t) payload[offset + 1]);
++      };
++      int total_data = u16(10);
++      int total_parity = u16(12);
++      int received_data = u16(14);
++      int received_parity = u16(16);
++      int lost = std::max(0, total_data + total_parity - received_data - received_parity);
++      bool dropped = received_data + received_parity < total_data;
++      BOOST_LOG(verbose)
++        << "type [SS_FRAME_FEC_PTYPE] frame ["sv << ((std::uint32_t(u16(0)) << 16) | u16(2)) << "] lost ["sv << lost
++        << "] data ["sv << received_data << '/' << total_data << "] parity ["sv << received_parity << '/' << total_parity
++        << (dropped ? "] dropped"sv : "] repaired"sv);
++      abr_note_loss(session, lost, dropped);
++    });
++
+     server->map(packetTypes[IDX_REQUEST_IDR_FRAME], [&](session_t *session, const std::string_view &payload) {
+       BOOST_LOG(debug) << "type [IDX_REQUEST_IDR_FRAME]"sv;
+ 
+       session->video.idr_events->raise(true);
++      abr_note_loss(session, 0, false);  // the client lost a frame and could not recover it
+     });
+ 
+     server->map(packetTypes[IDX_INVALIDATE_REF_FRAMES], [&](session_t *session, const std::string_view &payload) {
+@@ -1207,6 +1354,7 @@ namespace stream {
+         << "lastFrame [" << lastFrame << ']';
+ 
+       session->video.invalidate_ref_frames_events->raise(std::make_pair(firstFrame, lastFrame));
++      abr_note_loss(session, 0, false);  // the client lost frames and asks to invalidate them
+     });
+ 
+     server->map(packetTypes[IDX_INPUT_DATA], [&](session_t *session, const std::string_view &payload) {
+@@ -2330,6 +2478,8 @@ namespace stream {
+ 
+       session->video.idr_events = mail->event<bool>(mail::idr);
+       session->video.invalidate_ref_frames_events = mail->event<std::pair<int64_t, int64_t>>(mail::invalidate_ref_frames);
++      session->video.bitrate_events = mail->event<int>(mail::bitrate);
++      abr_init(session->video.abr, config.monitor.bitrate);
+       session->video.lowseq = 0;
+       session->video.ping_payload = launch_session.av_ping_payload;
+       if (config.encryptionFlagsEnabled & SS_ENC_VIDEO) {
+diff --git a/src/video.cpp b/src/video.cpp
+index 843a19a0..ce975ce8 100644
+--- a/src/video.cpp
++++ b/src/video.cpp
+@@ -597,6 +597,13 @@ namespace video {
+       }
+     }
+ 
++    bool set_bitrate(int bitrate_kbps) override {
++      if (!device || !device->nvenc || bitrate_kbps <= 0) {
++        return false;
++      }
++      return device->nvenc->set_bitrate(static_cast<std::uint32_t>(bitrate_kbps));
++    }
++
+     /**
+      * @brief Submit the next frame to NVENC and return the encoded payload.
+      *
+@@ -626,6 +633,7 @@ namespace video {
+     safe::mail_raw_t::event_t<bool> shutdown_event;  ///< Event raised when the stream should shut down.
+     safe::mail_raw_t::queue_t<packet_t> packets;  ///< Queue receiving encoded video packets for the stream sender.
+     safe::mail_raw_t::event_t<bool> idr_events;  ///< Event raised when an IDR frame is requested.
++    safe::mail_raw_t::event_t<int> bitrate_events;  ///< Event carrying a new adaptive bitrate target in kbps.
+     safe::mail_raw_t::event_t<hdr_info_t> hdr_events;  ///< Event carrying updated HDR metadata.
+     safe::mail_raw_t::event_t<input::touch_port_t> touch_port_events;  ///< Event carrying updated touch viewport metadata.
+ 
+@@ -2439,6 +2447,7 @@ namespace video {
+     auto packets = mail::man->queue<packet_t>(mail::video_packets);
+     auto idr_events = mail->event<bool>(mail::idr);
+     auto invalidate_ref_frames_events = mail->event<std::pair<int64_t, int64_t>>(mail::invalidate_ref_frames);
++    auto bitrate_events = mail->event<int>(mail::bitrate);
+ 
+     {
+       // Load a dummy image into the AVFrame to ensure we have something to encode
+@@ -2465,6 +2474,12 @@ namespace video {
+         idr_events->pop();
+       }
+ 
++      if (bitrate_events->peek()) {
++        if (auto bitrate = bitrate_events->pop(0ms)) {
++          session->set_bitrate(*bitrate);
++        }
++      }
++
+       if (requested_idr_frame) {
+         session->request_idr_frame();
+       }
+@@ -2781,6 +2796,12 @@ namespace video {
+             ctx->idr_events->pop();
+           }
+ 
++          if (ctx->bitrate_events->peek()) {
++            if (auto bitrate = ctx->bitrate_events->pop(0ms)) {
++              pos->session->set_bitrate(*bitrate);
++            }
++          }
++
+           if (frame_captured && pos->session->convert(*img)) {
+             BOOST_LOG(error) << "Could not convert image"sv;
+             ctx->shutdown_event->raise(true);
+@@ -2983,6 +3004,7 @@ namespace video {
+         mail->event<bool>(mail::shutdown),
+         mail::man->queue<packet_t>(mail::video_packets),
+         std::move(idr_events),
++        mail->event<int>(mail::bitrate),
+         mail->event<hdr_info_t>(mail::hdr),
+         mail->event<input::touch_port_t>(mail::touch_port),
+         config,
+diff --git a/src/video.h b/src/video.h
+index 63f3cf55..24e62b88 100644
+--- a/src/video.h
++++ b/src/video.h
+@@ -449,6 +449,15 @@ namespace video {
+      * @param last_frame Last frame.
+      */
+     virtual void invalidate_ref_frames(int64_t first_frame, int64_t last_frame) = 0;
++
++    /**
++     * @brief Change the encoder bitrate while streaming, when the encoder supports it.
++     * @param bitrate_kbps New average bitrate in kbps.
++     * @return `true` when the new bitrate was applied.
++     */
++    virtual bool set_bitrate(int bitrate_kbps) {
++      return false;
++    }
+   };
+ 
+   // encoders
+-- 
+2.54.0.windows.1
+
