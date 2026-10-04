@@ -1,6 +1,6 @@
-From 9b8b303cb56e929b50e306c3c27b05f06e6ba69a Mon Sep 17 00:00:00 2001
+From b12af666911f9709058fbb597c9eea9714280440 Mon Sep 17 00:00:00 2001
 From: chezjv <chezjv@users.noreply.github.com>
-Date: Sun, 4 Oct 2026 23:54:43 +0200
+Date: Mon, 5 Oct 2026 00:46:11 +0200
 Subject: [PATCH 1/2] feat(video): adaptive bitrate driven by client loss
  reports (NVENC)
 
@@ -27,23 +27,23 @@ New configuration options: adaptive_bitrate (disabled by default),
 adaptive_bitrate_min_percent, adaptive_bitrate_decrease_percent and
 adaptive_bitrate_increase_delay.
 ---
- docs/configuration.md                         | 114 +++++++++++
+ docs/configuration.md                         | 114 ++++++++++
  src/config.cpp                                |  10 +-
  src/config.h                                  |   4 +
  src/globals.h                                 |   1 +
- src/nvenc/nvenc_base.cpp                      |  47 +++++
+ src/nvenc/nvenc_base.cpp                      |  47 ++++
  src/nvenc/nvenc_base.h                        |  17 ++
  src/nvenc/nvenc_encoder.h                     |   9 +
- src/stream.cpp                                | 193 ++++++++++++++++++
+ src/stream.cpp                                | 201 ++++++++++++++++++
  src/video.cpp                                 |  22 ++
  src/video.h                                   |   9 +
  src_assets/common/assets/web/config.html      |   6 +-
  .../tabs/audiovideo/DisplayModesSettings.vue  |  31 +++
  .../assets/web/public/assets/locale/en.json   |   8 +
- 13 files changed, 469 insertions(+), 2 deletions(-)
+ 13 files changed, 477 insertions(+), 2 deletions(-)
 
 diff --git a/docs/configuration.md b/docs/configuration.md
-index 1ffd8250..024499f6 100644
+index 1ffd8250..7fc4499c 100644
 --- a/docs/configuration.md
 +++ b/docs/configuration.md
 @@ -1494,6 +1494,120 @@ supported on the current platform.
@@ -139,7 +139,7 @@ index 1ffd8250..024499f6 100644
 +    <tr>
 +        <td>Description</td>
 +        <td colspan="2">
-+            Time without any packet loss, in milliseconds, required before the bitrate is raised again (by 15%, at least
++            Time without any packet loss, in milliseconds, required before the bitrate is raised again (by 20%, at least
 +            500 kbps). The wait doubles each time an increase is followed by losses, up to 60 seconds.
 +        </td>
 +    </tr>
@@ -342,10 +342,10 @@ index 4c750583..110b40ec 100644
  
  }  // namespace nvenc
 diff --git a/src/stream.cpp b/src/stream.cpp
-index 1291c9c6..1b970aed 100644
+index 1291c9c6..c8d21148 100644
 --- a/src/stream.cpp
 +++ b/src/stream.cpp
-@@ -365,6 +365,56 @@ namespace stream {
+@@ -365,6 +365,60 @@ namespace stream {
      }
    }
  
@@ -368,6 +368,7 @@ index 1291c9c6..1b970aed 100644
 +    std::chrono::steady_clock::time_point last_loss;  ///< Last time a loss was reported.
 +    std::chrono::milliseconds probe_delay {0};  ///< Clean time required before the next increase; grows when an increase causes losses.
 +    int impaired_frames = 0;  ///< Frames repaired by FEC, dropped or invalidated in the current window.
++    int dropped_frames = 0;  ///< Frames lost beyond FEC repair in the current window.
 +    int lost_packets = 0;  ///< Video packets lost in the current window.
 +  };
 +
@@ -375,8 +376,11 @@ index 1291c9c6..1b970aed 100644
 +  constexpr auto ABR_DECREASE_COOLDOWN = std::chrono::milliseconds {2000};  ///< Minimum time between two cuts.
 +  constexpr auto ABR_FAILED_PROBE_WINDOW = std::chrono::milliseconds {10000};  ///< A cut this soon after an increase marks the increase as a failed probe.
 +  constexpr auto ABR_PROBE_DELAY_MAX = std::chrono::milliseconds {60000};  ///< Longest wait before probing upwards again.
-+  constexpr int ABR_INCREASE_PERCENT = 15;  ///< Size of an upward step, in percent of the current bitrate.
++  constexpr int ABR_INCREASE_PERCENT = 20;  ///< Size of an upward step, in percent of the current bitrate.
 +  constexpr int ABR_STEP_KBPS = 500;  ///< Minimum upward step and rounding unit.
++  constexpr int ABR_LOSSY_FRAMES = 6;  ///< Impaired frames per window that make it lossy (about 10 % at 60 fps).
++  constexpr int ABR_LOSSY_PACKETS = 15;  ///< Lost packets per window that make it lossy.
++  constexpr int ABR_DROPPED_FRAMES = 2;  ///< Frames lost beyond FEC repair per window that trigger an immediate cut.
 +
 +  /**
 +   * @brief Reset the adaptive bitrate state for a new session.
@@ -402,7 +406,7 @@ index 1291c9c6..1b970aed 100644
    /**
     * @brief ENet control server that routes incoming control packets to stream sessions.
     */
-@@ -513,6 +563,8 @@ namespace stream {
+@@ -513,6 +567,8 @@ namespace stream {
  
        safe::mail_raw_t::event_t<bool> idr_events;  ///< Event requesting an instantaneous decoder refresh frame.
        safe::mail_raw_t::event_t<std::pair<int64_t, int64_t>> invalidate_ref_frames_events;  ///< Event carrying the reference-frame range to invalidate.
@@ -411,7 +415,7 @@ index 1291c9c6..1b970aed 100644
  
        std::unique_ptr<platf::deinit_t> qos;  ///< Lifetime guard for video-socket QoS configuration.
      } video;  ///< Video worker thread state for the active stream.
-@@ -656,6 +708,117 @@ namespace stream {
+@@ -656,6 +712,121 @@ namespace stream {
      };
    }
  
@@ -492,8 +496,11 @@ index 1291c9c6..1b970aed 100644
 +    abr.impaired_frames += 1;
 +    abr.lost_packets += std::max(0, lost_packets);
 +    if (frame_dropped) {
-+      // FEC could not repair the frame: react right away instead of waiting for the end of the window
-+      abr_decrease(session, "frame lost");
++      abr.dropped_frames += 1;
++      if (abr.dropped_frames >= ABR_DROPPED_FRAMES) {
++        // FEC could not repair several frames: react right away instead of waiting for the end of the window
++        abr_decrease(session, "frames lost");
++      }
 +    }
 +  }
 +
@@ -510,9 +517,10 @@ index 1291c9c6..1b970aed 100644
 +    if (now - abr.window_start < ABR_WINDOW) {
 +      return;
 +    }
-+    bool lossy = abr.impaired_frames >= 2 || abr.lost_packets >= 5;
++    bool lossy = abr.impaired_frames >= ABR_LOSSY_FRAMES || abr.lost_packets >= ABR_LOSSY_PACKETS || abr.dropped_frames >= ABR_DROPPED_FRAMES;
 +    abr.window_start = now;
 +    abr.impaired_frames = 0;
++    abr.dropped_frames = 0;
 +    abr.lost_packets = 0;
 +    if (lossy) {
 +      abr_decrease(session, "packet loss");
@@ -529,7 +537,7 @@ index 1291c9c6..1b970aed 100644
    session_t *control_server_t::get_session(const net::peer_t peer, uint32_t connect_data) {
      {
        // Fast path - look up existing session by peer
-@@ -1163,6 +1326,7 @@ namespace stream {
+@@ -1163,6 +1334,7 @@ namespace stream {
     */
    void controlBroadcastThread(control_server_t *server) {
      server->map(packetTypes[IDX_PERIODIC_PING], [](session_t *session, const std::string_view &payload) {
@@ -537,7 +545,7 @@ index 1291c9c6..1b970aed 100644
        BOOST_LOG(verbose) << "type [IDX_PERIODIC_PING]"sv;
      });
  
-@@ -1175,6 +1339,7 @@ namespace stream {
+@@ -1175,6 +1347,7 @@ namespace stream {
      });
  
      server->map(packetTypes[IDX_LOSS_STATS], [&](session_t *session, const std::string_view &payload) {
@@ -545,7 +553,7 @@ index 1291c9c6..1b970aed 100644
        int32_t *stats = (int32_t *) payload.data();
        auto count = stats[0];
        std::chrono::milliseconds t {stats[1]};
-@@ -1190,10 +1355,35 @@ namespace stream {
+@@ -1190,10 +1363,35 @@ namespace stream {
          << "---end stats---";
      });
  
@@ -581,7 +589,7 @@ index 1291c9c6..1b970aed 100644
      });
  
      server->map(packetTypes[IDX_INVALIDATE_REF_FRAMES], [&](session_t *session, const std::string_view &payload) {
-@@ -1207,6 +1397,7 @@ namespace stream {
+@@ -1207,6 +1405,7 @@ namespace stream {
          << "lastFrame [" << lastFrame << ']';
  
        session->video.invalidate_ref_frames_events->raise(std::make_pair(firstFrame, lastFrame));
@@ -589,7 +597,7 @@ index 1291c9c6..1b970aed 100644
      });
  
      server->map(packetTypes[IDX_INPUT_DATA], [&](session_t *session, const std::string_view &payload) {
-@@ -2330,6 +2521,8 @@ namespace stream {
+@@ -2330,6 +2529,8 @@ namespace stream {
  
        session->video.idr_events = mail->event<bool>(mail::idr);
        session->video.invalidate_ref_frames_events = mail->event<std::pair<int64_t, int64_t>>(mail::invalidate_ref_frames);
@@ -753,7 +761,7 @@ index 51b5b8c2..3db64d81 100644
  
  <style scoped>
 diff --git a/src_assets/common/assets/web/public/assets/locale/en.json b/src_assets/common/assets/web/public/assets/locale/en.json
-index 313a4ace..6f549e3f 100644
+index 313a4ace..78770b68 100644
 --- a/src_assets/common/assets/web/public/assets/locale/en.json
 +++ b/src_assets/common/assets/web/public/assets/locale/en.json
 @@ -113,6 +113,14 @@
@@ -765,7 +773,7 @@ index 313a4ace..6f549e3f 100644
 +    "adaptive_bitrate_decrease_percent": "Adaptive Bitrate Decrease (%)",
 +    "adaptive_bitrate_decrease_percent_desc": "Bitrate reduction applied each time a one second window contains packet loss, in percent of the current bitrate.",
 +    "adaptive_bitrate_increase_delay": "Adaptive Bitrate Increase Delay (ms)",
-+    "adaptive_bitrate_increase_delay_desc": "Time without packet loss required before the bitrate is raised again by 15%. The wait doubles each time an increase is followed by losses, up to 60 seconds.",
++    "adaptive_bitrate_increase_delay_desc": "Time without packet loss required before the bitrate is raised again by 20%. The wait doubles each time an increase is followed by losses, up to 60 seconds.",
 +    "adaptive_bitrate_min_percent": "Adaptive Bitrate Floor (%)",
 +    "adaptive_bitrate_min_percent_desc": "Lowest bitrate the controller may use, in percent of the bitrate requested by Moonlight.",
      "add": "Add",

@@ -24,7 +24,10 @@ notification ntfy (secret `NTFY_TOPIC`).
 | `adaptive_bitrate` | `disabled` | Active le régulateur (NVENC seulement). |
 | `adaptive_bitrate_min_percent` | `20` | Plancher, en pourcentage du débit demandé par Moonlight (5-100). |
 | `adaptive_bitrate_decrease_percent` | `25` | Baisse appliquée à chaque seconde avec pertes (5-75). |
-| `adaptive_bitrate_increase_delay` | `8000` | Temps sans perte, en ms, avant de remonter de 15 % (1000-60000). Double après chaque remontée suivie de pertes, jusqu'à 60 s. |
+| `adaptive_bitrate_increase_delay` | `8000` | Temps sans perte, en ms, avant de remonter de 20 % (au moins 500 kb/s ; 1000-60000). Double après chaque remontée suivie de pertes, jusqu'à 60 s. |
+
+Seuils fixes (dans `stream.cpp`) : une seconde est « avec pertes » si elle compte au moins 6 images abîmées (≈ 10 % à 60 i/s),
+15 paquets perdus, ou 2 images irrécupérables (ce dernier cas déclenche la baisse immédiatement) ; 2 s minimum entre deux baisses.
 
 ## Fonctionnement
 
