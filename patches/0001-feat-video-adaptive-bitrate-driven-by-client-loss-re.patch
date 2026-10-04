@@ -1,6 +1,6 @@
-From 100603c07c0203ed4b9c558bdd498dedce8c9d99 Mon Sep 17 00:00:00 2001
+From 9b8b303cb56e929b50e306c3c27b05f06e6ba69a Mon Sep 17 00:00:00 2001
 From: chezjv <chezjv@users.noreply.github.com>
-Date: Sun, 4 Oct 2026 23:15:19 +0200
+Date: Sun, 4 Oct 2026 23:54:43 +0200
 Subject: [PATCH 1/2] feat(video): adaptive bitrate driven by client loss
  reports (NVENC)
 
@@ -27,17 +27,20 @@ New configuration options: adaptive_bitrate (disabled by default),
 adaptive_bitrate_min_percent, adaptive_bitrate_decrease_percent and
 adaptive_bitrate_increase_delay.
 ---
- docs/configuration.md     | 114 ++++++++++++++++++++++
- src/config.cpp            |  10 +-
- src/config.h              |   4 +
- src/globals.h             |   1 +
- src/nvenc/nvenc_base.cpp  |  47 ++++++++++
- src/nvenc/nvenc_base.h    |  17 ++++
- src/nvenc/nvenc_encoder.h |   9 ++
- src/stream.cpp            | 193 ++++++++++++++++++++++++++++++++++++++
- src/video.cpp             |  22 +++++
- src/video.h               |   9 ++
- 10 files changed, 425 insertions(+), 1 deletion(-)
+ docs/configuration.md                         | 114 +++++++++++
+ src/config.cpp                                |  10 +-
+ src/config.h                                  |   4 +
+ src/globals.h                                 |   1 +
+ src/nvenc/nvenc_base.cpp                      |  47 +++++
+ src/nvenc/nvenc_base.h                        |  17 ++
+ src/nvenc/nvenc_encoder.h                     |   9 +
+ src/stream.cpp                                | 193 ++++++++++++++++++
+ src/video.cpp                                 |  22 ++
+ src/video.h                                   |   9 +
+ src_assets/common/assets/web/config.html      |   6 +-
+ .../tabs/audiovideo/DisplayModesSettings.vue  |  31 +++
+ .../assets/web/public/assets/locale/en.json   |   8 +
+ 13 files changed, 469 insertions(+), 2 deletions(-)
 
 diff --git a/docs/configuration.md b/docs/configuration.md
 index 1ffd8250..024499f6 100644
@@ -683,6 +686,91 @@ index 63f3cf55..24e62b88 100644
    };
  
    // encoders
+diff --git a/src_assets/common/assets/web/config.html b/src_assets/common/assets/web/config.html
+index 8b618414..c5f0ba3a 100644
+--- a/src_assets/common/assets/web/config.html
++++ b/src_assets/common/assets/web/config.html
+@@ -262,7 +262,11 @@
+               "dd_config_revert_on_disconnect": "disabled",
+               "dd_mode_remapping": {"mixed": [], "resolution_only": [], "refresh_rate_only": []},
+               "max_bitrate": 0,
+-              "minimum_fps_target": 0
++              "minimum_fps_target": 0,
++              "adaptive_bitrate": "disabled",
++              "adaptive_bitrate_min_percent": 20,
++              "adaptive_bitrate_decrease_percent": 25,
++              "adaptive_bitrate_increase_delay": 8000
+             },
+           },
+           {
+diff --git a/src_assets/common/assets/web/configs/tabs/audiovideo/DisplayModesSettings.vue b/src_assets/common/assets/web/configs/tabs/audiovideo/DisplayModesSettings.vue
+index 51b5b8c2..3db64d81 100644
+--- a/src_assets/common/assets/web/configs/tabs/audiovideo/DisplayModesSettings.vue
++++ b/src_assets/common/assets/web/configs/tabs/audiovideo/DisplayModesSettings.vue
+@@ -2,6 +2,7 @@
+ import { ref } from 'vue'
+ import { $tp } from '../../../platform-i18n'
+ import PlatformLayout from '../../../PlatformLayout.vue'
++import Checkbox from "../../../Checkbox.vue";
+ 
+ const props = defineProps([
+   'platform',
+@@ -24,6 +25,36 @@ const config = ref(props.config)
+     <input type="number" min="0" max="1000" class="form-control" id="minimum_fps_target" placeholder="0" v-model="config.minimum_fps_target" />
+     <div class="form-text">{{ $t("config.minimum_fps_target_desc") }}</div>
+   </div>
++
++  <!--adaptive_bitrate-->
++  <div class="mb-3">
++    <Checkbox id="adaptive_bitrate"
++      locale-prefix="config"
++      v-model="config.adaptive_bitrate"
++      default="false"
++    ></Checkbox>
++  </div>
++
++  <!--adaptive_bitrate_min_percent-->
++  <div class="mb-3">
++    <label for="adaptive_bitrate_min_percent" class="form-label">{{ $t("config.adaptive_bitrate_min_percent") }}</label>
++    <input type="number" min="5" max="100" class="form-control" id="adaptive_bitrate_min_percent" placeholder="20" v-model="config.adaptive_bitrate_min_percent" />
++    <div class="form-text">{{ $t("config.adaptive_bitrate_min_percent_desc") }}</div>
++  </div>
++
++  <!--adaptive_bitrate_decrease_percent-->
++  <div class="mb-3">
++    <label for="adaptive_bitrate_decrease_percent" class="form-label">{{ $t("config.adaptive_bitrate_decrease_percent") }}</label>
++    <input type="number" min="5" max="75" class="form-control" id="adaptive_bitrate_decrease_percent" placeholder="25" v-model="config.adaptive_bitrate_decrease_percent" />
++    <div class="form-text">{{ $t("config.adaptive_bitrate_decrease_percent_desc") }}</div>
++  </div>
++
++  <!--adaptive_bitrate_increase_delay-->
++  <div class="mb-3">
++    <label for="adaptive_bitrate_increase_delay" class="form-label">{{ $t("config.adaptive_bitrate_increase_delay") }}</label>
++    <input type="number" min="1000" max="60000" step="500" class="form-control" id="adaptive_bitrate_increase_delay" placeholder="8000" v-model="config.adaptive_bitrate_increase_delay" />
++    <div class="form-text">{{ $t("config.adaptive_bitrate_increase_delay_desc") }}</div>
++  </div>
+ </template>
+ 
+ <style scoped>
+diff --git a/src_assets/common/assets/web/public/assets/locale/en.json b/src_assets/common/assets/web/public/assets/locale/en.json
+index 313a4ace..6f549e3f 100644
+--- a/src_assets/common/assets/web/public/assets/locale/en.json
++++ b/src_assets/common/assets/web/public/assets/locale/en.json
+@@ -113,6 +113,14 @@
+     "adapter_name_desc_linux_3": "Replace ``renderD129`` with the device from above to lists the name and capabilities of the device. To be supported by Sunshine, it needs to have at the very minimum:",
+     "adapter_name_desc_windows": "Manually specify a GPU to use for capture. If unset, the GPU is chosen automatically. We strongly recommend leaving this field blank to use automatic GPU selection! Note: This GPU must have a display connected and powered on. The appropriate values can be found using the following command:",
+     "adapter_name_placeholder_windows": "Radeon RX 580 Series",
++    "adaptive_bitrate": "Adaptive Bitrate",
++    "adaptive_bitrate_desc": "Lower the video bitrate while Moonlight reports packet loss and raise it back, step by step, once the link has been clean for a while. The bitrate never exceeds the value requested by Moonlight and the stream is never interrupted. Requires the NVENC encoder.",
++    "adaptive_bitrate_decrease_percent": "Adaptive Bitrate Decrease (%)",
++    "adaptive_bitrate_decrease_percent_desc": "Bitrate reduction applied each time a one second window contains packet loss, in percent of the current bitrate.",
++    "adaptive_bitrate_increase_delay": "Adaptive Bitrate Increase Delay (ms)",
++    "adaptive_bitrate_increase_delay_desc": "Time without packet loss required before the bitrate is raised again by 15%. The wait doubles each time an increase is followed by losses, up to 60 seconds.",
++    "adaptive_bitrate_min_percent": "Adaptive Bitrate Floor (%)",
++    "adaptive_bitrate_min_percent_desc": "Lowest bitrate the controller may use, in percent of the bitrate requested by Moonlight.",
+     "add": "Add",
+     "address_family": "Address Family",
+     "address_family_both": "IPv4+IPv6",
 -- 
 2.54.0.windows.1
 
