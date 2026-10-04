@@ -449,6 +449,15 @@ namespace video {
      * @param last_frame Last frame.
      */
     virtual void invalidate_ref_frames(int64_t first_frame, int64_t last_frame) = 0;
+
+    /**
+     * @brief Change the encoder bitrate while streaming, when the encoder supports it.
+     * @param bitrate_kbps New average bitrate in kbps.
+     * @return `true` when the new bitrate was applied.
+     */
+    virtual bool set_bitrate(int bitrate_kbps) {
+      return false;
+    }
   };
 
   // encoders

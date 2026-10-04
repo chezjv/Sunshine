@@ -1494,6 +1494,120 @@ supported on the current platform.
     </tr>
 </table>
 
+### adaptive_bitrate
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Lower the video bitrate while the client reports packet loss and raise it back, step by step, once the
+            link has been clean for a while. The bitrate never exceeds the value requested by Moonlight and the
+            encoder is reconfigured on the fly, so the stream is never interrupted. Requires the NVENC encoder.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            disabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            adaptive_bitrate = enabled
+            @endcode</td>
+    </tr>
+</table>
+
+### adaptive_bitrate_min_percent
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Floor of the adaptive bitrate, in percent of the bitrate requested by Moonlight.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            20
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Range</td>
+        <td colspan="2">@code{}
+            5-100
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            adaptive_bitrate_min_percent = 30
+            @endcode</td>
+    </tr>
+</table>
+
+### adaptive_bitrate_decrease_percent
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Bitrate reduction applied each time a one second window contains packet loss, in percent of the current bitrate.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            25
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Range</td>
+        <td colspan="2">@code{}
+            5-75
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            adaptive_bitrate_decrease_percent = 30
+            @endcode</td>
+    </tr>
+</table>
+
+### adaptive_bitrate_increase_delay
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Time without any packet loss, in milliseconds, required before the bitrate is raised again (by 20%, at least
+            500 kbps). The wait doubles each time an increase is followed by losses, up to 60 seconds.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            8000
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Range</td>
+        <td colspan="2">@code{}
+            1000-60000
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            adaptive_bitrate_increase_delay = 5000
+            @endcode</td>
+    </tr>
+</table>
+
+
 ## Network
 
 ### upnp

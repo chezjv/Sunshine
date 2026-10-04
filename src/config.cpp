@@ -795,7 +795,11 @@ namespace config {
     },  // display_device
 
     0,  // max_bitrate
-    0  // minimum_fps_target (0 = framerate)
+    0,  // minimum_fps_target (0 = framerate)
+    false,  // adaptive_bitrate
+    20,  // adaptive_bitrate_min_percent
+    25,  // adaptive_bitrate_decrease_percent
+    8000  // adaptive_bitrate_increase_delay
   };
 
   /**
@@ -1722,6 +1726,10 @@ namespace config {
 
     int_f(vars, "max_bitrate", video.max_bitrate);
     double_between_f(vars, "minimum_fps_target", video.minimum_fps_target, {0.0, 1000.0});
+    bool_f(vars, "adaptive_bitrate", video.adaptive_bitrate);
+    int_between_f(vars, "adaptive_bitrate_min_percent", video.adaptive_bitrate_min_percent, {5, 100});
+    int_between_f(vars, "adaptive_bitrate_decrease_percent", video.adaptive_bitrate_decrease_percent, {5, 75});
+    int_between_f(vars, "adaptive_bitrate_increase_delay", video.adaptive_bitrate_increase_delay, {1000, 60000});
 
     path_f(vars, "pkey", nvhttp.pkey);
     path_f(vars, "cert", nvhttp.cert);

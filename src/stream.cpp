@@ -366,6 +366,60 @@ namespace stream {
   }
 
   /**
+   * @brief Host-side adaptive bitrate controller state, one per session.
+   *
+   * Moonlight reports every frame that needed FEC recovery or was dropped (`SS_FRAME_FEC_STATUS`) and asks for
+   * an IDR frame or a reference frame invalidation when a frame was lost. Those signals drive an AIMD loop:
+   * the encoder bitrate is cut when a one second window contains losses and raised again, step by step, once
+   * the link has stayed clean for a while. The bitrate never exceeds the value requested by the client.
+   */
+  struct adaptive_bitrate_t {
+    bool enabled = false;  ///< `true` when `adaptive_bitrate` is enabled and the client requested a bitrate.
+    int requested_kbps = 0;  ///< Bitrate requested by the client (ceiling).
+    int current_kbps = 0;  ///< Bitrate currently applied to the encoder.
+    int min_kbps = 0;  ///< Floor derived from `adaptive_bitrate_min_percent`.
+    std::chrono::steady_clock::time_point window_start;  ///< Start of the current one second measurement window.
+    std::chrono::steady_clock::time_point last_decrease;  ///< Last time the bitrate was cut.
+    std::chrono::steady_clock::time_point last_increase;  ///< Last time the bitrate was raised.
+    std::chrono::steady_clock::time_point last_loss;  ///< Last time a loss was reported.
+    std::chrono::milliseconds probe_delay {0};  ///< Clean time required before the next increase; grows when an increase causes losses.
+    int impaired_frames = 0;  ///< Frames repaired by FEC, dropped or invalidated in the current window.
+    int dropped_frames = 0;  ///< Frames lost beyond FEC repair in the current window.
+    int lost_packets = 0;  ///< Video packets lost in the current window.
+  };
+
+  constexpr auto ABR_WINDOW = std::chrono::milliseconds {1000};  ///< Measurement window.
+  constexpr auto ABR_DECREASE_COOLDOWN = std::chrono::milliseconds {2000};  ///< Minimum time between two cuts.
+  constexpr auto ABR_FAILED_PROBE_WINDOW = std::chrono::milliseconds {10000};  ///< A cut this soon after an increase marks the increase as a failed probe.
+  constexpr auto ABR_PROBE_DELAY_MAX = std::chrono::milliseconds {60000};  ///< Longest wait before probing upwards again.
+  constexpr int ABR_INCREASE_PERCENT = 20;  ///< Size of an upward step, in percent of the current bitrate.
+  constexpr int ABR_STEP_KBPS = 500;  ///< Minimum upward step and rounding unit.
+  constexpr int ABR_LOSSY_FRAMES = 6;  ///< Impaired frames per window that make it lossy (about 10 % at 60 fps).
+  constexpr int ABR_LOSSY_PACKETS = 15;  ///< Lost packets per window that make it lossy.
+  constexpr int ABR_DROPPED_FRAMES = 2;  ///< Frames lost beyond FEC repair per window that trigger an immediate cut.
+
+  /**
+   * @brief Reset the adaptive bitrate state for a new session.
+   * @param abr Controller state to initialize.
+   * @param requested_kbps Bitrate requested by the client, in kbps.
+   */
+  void abr_init(adaptive_bitrate_t &abr, int requested_kbps);
+
+  /**
+   * @brief Evaluate the current measurement window; called on every periodic ping from the client.
+   * @param session Stream session.
+   */
+  void abr_tick(session_t *session);
+
+  /**
+   * @brief Record a frame the client could not receive intact.
+   * @param session Stream session.
+   * @param lost_packets Number of video packets lost for that frame, when known.
+   * @param frame_dropped `true` when FEC could not repair the frame.
+   */
+  void abr_note_loss(session_t *session, int lost_packets, bool frame_dropped);
+
+  /**
    * @brief ENet control server that routes incoming control packets to stream sessions.
    */
   class control_server_t {
@@ -513,6 +567,8 @@ namespace stream {
 
       safe::mail_raw_t::event_t<bool> idr_events;  ///< Event requesting an instantaneous decoder refresh frame.
       safe::mail_raw_t::event_t<std::pair<int64_t, int64_t>> invalidate_ref_frames_events;  ///< Event carrying the reference-frame range to invalidate.
+      safe::mail_raw_t::event_t<int> bitrate_events;  ///< Event carrying a new adaptive bitrate target in kbps.
+      adaptive_bitrate_t abr;  ///< Adaptive bitrate controller state.
 
       std::unique_ptr<platf::deinit_t> qos;  ///< Lifetime guard for video-socket QoS configuration.
     } video;  ///< Video worker thread state for the active stream.
@@ -654,6 +710,121 @@ namespace stream {
         packet.dataLength - sizeof(type),
       },
     };
+  }
+
+  /**
+   * @brief Reset the adaptive bitrate state for a new session.
+   * @param abr Controller state to initialize.
+   * @param requested_kbps Bitrate requested by the client, in kbps.
+   */
+  void abr_init(adaptive_bitrate_t &abr, int requested_kbps) {
+    abr = {};
+    if (config::video.max_bitrate > 0) {
+      requested_kbps = std::min(requested_kbps, config::video.max_bitrate);
+    }
+    abr.enabled = config::video.adaptive_bitrate && requested_kbps > 0;
+    abr.requested_kbps = requested_kbps;
+    abr.current_kbps = requested_kbps;
+    abr.min_kbps = std::max(ABR_STEP_KBPS, requested_kbps * config::video.adaptive_bitrate_min_percent / 100);
+    abr.probe_delay = std::chrono::milliseconds {config::video.adaptive_bitrate_increase_delay};
+    auto now = std::chrono::steady_clock::now();
+    abr.window_start = now;
+    abr.last_decrease = now;
+    abr.last_increase = now;
+    abr.last_loss = now;
+    if (abr.enabled) {
+      BOOST_LOG(info) << "Adaptive bitrate enabled: "sv << requested_kbps << " kbps requested, floor "sv << abr.min_kbps << " kbps"sv;
+    }
+  }
+
+  /**
+   * @brief Apply a new bitrate target: round it, clamp it between the floor and the requested bitrate, and send it to the encoder.
+   * @param session Stream session.
+   * @param kbps Desired bitrate in kbps.
+   * @param reason Short description logged with the change.
+   */
+  void abr_apply(session_t *session, int kbps, const char *reason) {
+    auto &abr = session->video.abr;
+    kbps = kbps / ABR_STEP_KBPS * ABR_STEP_KBPS;
+    kbps = std::max(abr.min_kbps, std::min(kbps, abr.requested_kbps));
+    if (kbps == abr.current_kbps) {
+      return;
+    }
+    BOOST_LOG(info) << "Adaptive bitrate: "sv << abr.current_kbps << " -> "sv << kbps << " kbps ("sv << reason << ')';
+    abr.current_kbps = kbps;
+    session->video.bitrate_events->raise(kbps);
+  }
+
+  /**
+   * @brief Cut the bitrate after losses, at most once per cooldown period.
+   * @param session Stream session.
+   * @param reason Short description logged with the change.
+   */
+  void abr_decrease(session_t *session, const char *reason) {
+    auto &abr = session->video.abr;
+    auto now = std::chrono::steady_clock::now();
+    abr.last_loss = now;
+    if (now - abr.last_decrease < ABR_DECREASE_COOLDOWN) {
+      return;
+    }
+    if (abr.last_increase > abr.last_decrease && now - abr.last_increase < ABR_FAILED_PROBE_WINDOW) {
+      // the last increase caused losses: wait longer before probing upwards again
+      abr.probe_delay = std::min<std::chrono::milliseconds>(ABR_PROBE_DELAY_MAX, abr.probe_delay * 2);
+    }
+    abr.last_decrease = now;
+    abr_apply(session, abr.current_kbps * (100 - config::video.adaptive_bitrate_decrease_percent) / 100, reason);
+  }
+
+  /**
+   * @brief Record a frame the client could not receive intact.
+   * @param session Stream session.
+   * @param lost_packets Number of video packets lost for that frame, when known.
+   * @param frame_dropped `true` when FEC could not repair the frame.
+   */
+  void abr_note_loss(session_t *session, int lost_packets, bool frame_dropped) {
+    auto &abr = session->video.abr;
+    if (!abr.enabled) {
+      return;
+    }
+    abr.impaired_frames += 1;
+    abr.lost_packets += std::max(0, lost_packets);
+    if (frame_dropped) {
+      abr.dropped_frames += 1;
+      if (abr.dropped_frames >= ABR_DROPPED_FRAMES) {
+        // FEC could not repair several frames: react right away instead of waiting for the end of the window
+        abr_decrease(session, "frames lost");
+      }
+    }
+  }
+
+  /**
+   * @brief Evaluate the current measurement window; called on every periodic ping from the client.
+   * @param session Stream session.
+   */
+  void abr_tick(session_t *session) {
+    auto &abr = session->video.abr;
+    if (!abr.enabled) {
+      return;
+    }
+    auto now = std::chrono::steady_clock::now();
+    if (now - abr.window_start < ABR_WINDOW) {
+      return;
+    }
+    bool lossy = abr.impaired_frames >= ABR_LOSSY_FRAMES || abr.lost_packets >= ABR_LOSSY_PACKETS || abr.dropped_frames >= ABR_DROPPED_FRAMES;
+    abr.window_start = now;
+    abr.impaired_frames = 0;
+    abr.dropped_frames = 0;
+    abr.lost_packets = 0;
+    if (lossy) {
+      abr_decrease(session, "packet loss");
+      return;
+    }
+    if (abr.current_kbps < abr.requested_kbps && now - abr.last_loss >= abr.probe_delay && now - abr.last_increase >= abr.probe_delay) {
+      // the link has been clean long enough: probe upwards, and relax the wait after each successful step
+      abr.last_increase = now;
+      abr.probe_delay = std::max<std::chrono::milliseconds>(std::chrono::milliseconds {config::video.adaptive_bitrate_increase_delay}, abr.probe_delay / 2);
+      abr_apply(session, std::max(abr.current_kbps + ABR_STEP_KBPS, abr.current_kbps * (100 + ABR_INCREASE_PERCENT) / 100), "clean link");
+    }
   }
 
   session_t *control_server_t::get_session(const net::peer_t peer, uint32_t connect_data) {
@@ -1163,6 +1334,7 @@ namespace stream {
    */
   void controlBroadcastThread(control_server_t *server) {
     server->map(packetTypes[IDX_PERIODIC_PING], [](session_t *session, const std::string_view &payload) {
+      abr_tick(session);  // every ~100 ms with Sunshine-aware clients
       BOOST_LOG(verbose) << "type [IDX_PERIODIC_PING]"sv;
     });
 
@@ -1175,6 +1347,7 @@ namespace stream {
     });
 
     server->map(packetTypes[IDX_LOSS_STATS], [&](session_t *session, const std::string_view &payload) {
+      abr_tick(session);  // every ~50 ms with legacy clients
       int32_t *stats = (int32_t *) payload.data();
       auto count = stats[0];
       std::chrono::milliseconds t {stats[1]};
@@ -1190,10 +1363,35 @@ namespace stream {
         << "---end stats---";
     });
 
+    // Per-frame FEC status (Sunshine protocol extension sent by moonlight-common-c for every frame that needed
+    // FEC recovery or was dropped). Fields are big-endian; parsed by offset so struct packing cannot matter.
+    server->map(SS_FRAME_FEC_PTYPE, [](session_t *session, const std::string_view &payload) {
+      constexpr std::size_t fec_status_size = 21;
+      if (payload.size() < fec_status_size) {
+        BOOST_LOG(debug) << "type [SS_FRAME_FEC_PTYPE] with unexpected size "sv << payload.size();
+        return;
+      }
+      auto u16 = [&payload](std::size_t offset) {
+        return (std::uint16_t) (((std::uint8_t) payload[offset] << 8) | (std::uint8_t) payload[offset + 1]);
+      };
+      int total_data = u16(10);
+      int total_parity = u16(12);
+      int received_data = u16(14);
+      int received_parity = u16(16);
+      int lost = std::max(0, total_data + total_parity - received_data - received_parity);
+      bool dropped = received_data + received_parity < total_data;
+      BOOST_LOG(verbose)
+        << "type [SS_FRAME_FEC_PTYPE] frame ["sv << ((std::uint32_t(u16(0)) << 16) | u16(2)) << "] lost ["sv << lost
+        << "] data ["sv << received_data << '/' << total_data << "] parity ["sv << received_parity << '/' << total_parity
+        << (dropped ? "] dropped"sv : "] repaired"sv);
+      abr_note_loss(session, lost, dropped);
+    });
+
     server->map(packetTypes[IDX_REQUEST_IDR_FRAME], [&](session_t *session, const std::string_view &payload) {
       BOOST_LOG(debug) << "type [IDX_REQUEST_IDR_FRAME]"sv;
 
       session->video.idr_events->raise(true);
+      abr_note_loss(session, 0, false);  // the client lost a frame and could not recover it
     });
 
     server->map(packetTypes[IDX_INVALIDATE_REF_FRAMES], [&](session_t *session, const std::string_view &payload) {
@@ -1207,6 +1405,7 @@ namespace stream {
         << "lastFrame [" << lastFrame << ']';
 
       session->video.invalidate_ref_frames_events->raise(std::make_pair(firstFrame, lastFrame));
+      abr_note_loss(session, 0, false);  // the client lost frames and asks to invalidate them
     });
 
     server->map(packetTypes[IDX_INPUT_DATA], [&](session_t *session, const std::string_view &payload) {
@@ -2330,6 +2529,8 @@ namespace stream {
 
       session->video.idr_events = mail->event<bool>(mail::idr);
       session->video.invalidate_ref_frames_events = mail->event<std::pair<int64_t, int64_t>>(mail::invalidate_ref_frames);
+      session->video.bitrate_events = mail->event<int>(mail::bitrate);
+      abr_init(session->video.abr, config.monitor.bitrate);
       session->video.lowseq = 0;
       session->video.ping_payload = launch_session.av_ping_payload;
       if (config.encryptionFlagsEnabled & SS_ENC_VIDEO) {

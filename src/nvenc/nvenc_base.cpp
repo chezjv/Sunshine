@@ -671,9 +671,56 @@ namespace NVENC_NAMESPACE {
     BOOST_LOG(debug) << "NvEnc: requested encoded frame size "
                      << frame_size_format % (client_config.bitrate / 8. / client_config.framerate) << " kB";
     log_created_encoder(init_params, enc_config, config, client_config, buffer_format);
+    reconfigure_state.init_params = init_params;
+    reconfigure_state.config = enc_config;
+    reconfigure_state.init_params.encodeConfig = &reconfigure_state.config;
+    reconfigure_state.framerate = client_config.framerate;
+    reconfigure_state.vbv_percentage_increase = config.vbv_percentage_increase;
+    reconfigure_state.custom_vbv = get_encoder_cap(init_params.encodeGUID, NV_ENC_CAPS_SUPPORT_CUSTOM_VBV_BUF_SIZE) != 0;
+    reconfigure_state.dynamic_bitrate_supported = get_encoder_cap(init_params.encodeGUID, NV_ENC_CAPS_SUPPORT_DYN_BITRATE_CHANGE) != 0;
+    reconfigure_state.bitrate_kbps = client_config.bitrate;
 
     encoder_state = {};
     fail_guard.disable();
+    return true;
+  }
+
+  bool nvenc_base::set_bitrate(uint32_t bitrate_kbps) {
+    if (!encoder || !nvenc || bitrate_kbps == 0) {
+      return false;
+    }
+    if (bitrate_kbps == reconfigure_state.bitrate_kbps) {
+      return true;
+    }
+    if (!reconfigure_state.dynamic_bitrate_supported) {
+      BOOST_LOG(warning) << "NvEnc: the encoder does not support dynamic bitrate changes";
+      return false;
+    }
+
+    auto &rc = reconfigure_state.config.rcParams;
+    rc.averageBitRate = bitrate_kbps * 1000;
+    if (reconfigure_state.custom_vbv && reconfigure_state.framerate > 0) {
+      rc.vbvBufferSize = bitrate_kbps * 1000 / reconfigure_state.framerate;
+      if (reconfigure_state.vbv_percentage_increase > 0) {
+        rc.vbvBufferSize += rc.vbvBufferSize * reconfigure_state.vbv_percentage_increase / 100;
+      }
+    }
+
+    // Only the rate control parameters change: no encoder reset and no forced IDR frame,
+    // so the client sees nothing but a different frame size from the next frame on.
+    NV_ENC_RECONFIGURE_PARAMS reconfigure_params = {.version = NV_ENC_RECONFIGURE_PARAMS_VER};
+    reconfigure_params.reInitEncodeParams = reconfigure_state.init_params;
+    reconfigure_params.reInitEncodeParams.encodeConfig = &reconfigure_state.config;
+    reconfigure_params.resetEncoder = 0;
+    reconfigure_params.forceIDR = 0;
+
+    if (nvenc_failed(nvenc->nvEncReconfigureEncoder(encoder, &reconfigure_params))) {
+      BOOST_LOG(error) << "NvEnc: NvEncReconfigureEncoder() failed: " << last_nvenc_error_string;
+      return false;
+    }
+
+    BOOST_LOG(info) << "NvEnc: bitrate changed from " << reconfigure_state.bitrate_kbps << " to " << bitrate_kbps << " kbps";
+    reconfigure_state.bitrate_kbps = bitrate_kbps;
     return true;
   }
 

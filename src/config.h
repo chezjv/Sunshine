@@ -219,6 +219,10 @@ namespace config {
 
     int max_bitrate;  ///< Maximum bitrate ceiling in kbps for bitrate requested from the client.
     double minimum_fps_target;  ///< Lowest framerate that will be used when streaming. Range 0-1000, 0 = half of client's requested framerate.
+    bool adaptive_bitrate;  ///< Lower the encoder bitrate while packets are being lost and raise it back once the link is clean.
+    int adaptive_bitrate_min_percent;  ///< Floor of the adaptive bitrate, in percent of the bitrate requested by the client. Range 5-100.
+    int adaptive_bitrate_decrease_percent;  ///< Bitrate reduction applied at each lossy period, in percent. Range 5-75.
+    int adaptive_bitrate_increase_delay;  ///< Clean time, in milliseconds, required before raising the bitrate again. Range 1000-60000.
   };
 
   /**

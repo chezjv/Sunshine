@@ -75,6 +75,13 @@ namespace NVENC_NAMESPACE {
      */
     bool invalidate_ref_frames(uint64_t first_frame, uint64_t last_frame) override;
 
+    /**
+     * @brief Reconfigure the running encoder with a new average bitrate (`NvEncReconfigureEncoder()`).
+     * @param bitrate_kbps New average bitrate in kbps.
+     * @return `true` when the encoder applied the new bitrate.
+     */
+    bool set_bitrate(uint32_t bitrate_kbps) override;
+
   protected:
     /**
      * @brief Required. Used for loading NvEnc library and setting `nvenc` variable with `NvEncodeAPICreateInstance()`.
@@ -336,6 +343,16 @@ namespace NVENC_NAMESPACE {
       std::pair<uint64_t, uint64_t> last_rfi_range;
       logging::min_max_avg_periodic_logger<double> frame_size_logger = {debug, "NvEnc: encoded frame sizes in kB", ""};
     } encoder_state;
+
+    struct {
+      NV_ENC_INITIALIZE_PARAMS init_params = {};
+      NV_ENC_CONFIG config = {};
+      int framerate = 0;
+      int vbv_percentage_increase = 0;
+      bool custom_vbv = false;
+      bool dynamic_bitrate_supported = false;  ///< `NV_ENC_CAPS_SUPPORT_DYN_BITRATE_CHANGE` reported by the encoder.
+      uint32_t bitrate_kbps = 0;
+    } reconfigure_state;  ///< Copy of the creation parameters, reused by `set_bitrate()`.
   };
 
 }  // namespace NVENC_NAMESPACE
